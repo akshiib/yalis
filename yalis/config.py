@@ -89,6 +89,7 @@ class InferenceConfig:
         top_p: Optional[float] = 1.0,
         temperature: Optional[float] = 1.0,
         metrics: bool = False,
+        
     ):
         """
         Initialize the inference configuration.
