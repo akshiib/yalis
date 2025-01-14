@@ -155,6 +155,7 @@ class LLMEngine:
             batch_size=self.inference_config.batch_size,
             device=self.device,
             dtype=self.dtype,
+            paged_attention_block_size = self.inference_config.paged_attention_block_size
         )
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_config.model_name)
         # Check if the tokenizer has a pad token, otherwise use eos_token

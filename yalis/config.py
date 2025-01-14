@@ -83,13 +83,13 @@ class InferenceConfig:
 
     def __init__(
         self,
+        paged_attention_block_size: None | bool | int = None,
         batch_size: int = 1,
         max_length_of_generated_sequences: int = 1024,
         top_k: Optional[int] = None,
         top_p: Optional[float] = 1.0,
         temperature: Optional[float] = 1.0,
         metrics: bool = False,
-        
     ):
         """
         Initialize the inference configuration.
@@ -114,7 +114,7 @@ class InferenceConfig:
         self.top_k = top_k
         self.top_p = top_p
         self.metrics = metrics
-
+        self.paged_attention_block_size = 128 if isinstance(paged_attention_block_size, bool) and paged_attention_block_size == True else paged_attention_block_size
         self._validate()
 
     def _validate(self):

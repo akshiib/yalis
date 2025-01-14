@@ -7,7 +7,7 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -27,9 +27,11 @@ from torch.utils import checkpoint
 from .tensor_parallel import TPLinear
 from copy import deepcopy
 from axonn import axonn as ax
+from ..paged_sdpa_python import  PagedKVCache, paged_sdpa
+from .. import print_rank0
 from axonn.intra_layer.communication import Drop, Gather
 
-from yalis import print_rank0
+
 
 
 class GPT(nn.Module):
@@ -204,6 +206,8 @@ class GPT(nn.Module):
         rope_cache_length: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        paged_attention_block_size: Optional[int] = None,
+        
     ) -> None:
         if rope_cache_length is None:
             rope_cache_length = self.cos.size(-1)
@@ -221,6 +225,7 @@ class GPT(nn.Module):
                 rope_cache_length,
                 device,
                 dtype,
+                paged_attention_block_size
             )
 
         self.token_counter = torch.zeros(batch_size, device=device, dtype=torch.int32)
@@ -326,7 +331,7 @@ class CausalSelfAttention(nn.Module):
                 transpose=True,
             )
         # disabled by default
-        self.kv_cache: Optional[KVCache] = None
+        self.kv_cache: KVCache | PagedKVCache | None = None
         self.apply_sliding_window_attention = (
             config.sliding_window_size is not None
             and block_idx % config.sliding_window_layer_placing == 0
@@ -363,9 +368,12 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         token_counter: torch.Tensor,  # B,1
-        k_cache: torch.Tensor,  # B,nh,t_max,hs
-        v_cache: torch.Tensor,  # B,nh,t_max,hs,
+        k_cache: Optional[torch.Tensor] = None,  # B,nh,t_max,hs
+        v_cache: Optional[torch.Tensor] = None,  # B,nh,t_max,hs
+        paged_cache: Optional["PagedKVCache"] = None
     ) -> torch.Tensor:
+        
+        B, T =  q.size(0), q.size(2)
         cos = self.index_into_rope_cache_gen(cos, token_counter)
         sin = self.index_into_rope_cache_gen(sin, token_counter)
 
@@ -387,19 +395,33 @@ class CausalSelfAttention(nn.Module):
 
         q, k = roped_tensors
 
-        B = k_cache.size(0)
-        b_indices = torch.arange(B, device=k_cache.device)
 
-        k_cache[b_indices, :, token_counter.view(-1), :] = k[:, :, 0, :]
-        v_cache[b_indices, :, token_counter.view(-1), :] = v[:, :, 0, :]
-        mask = self.build_mask_from_index(token_counter, t_max=k_cache.size(-2))[
-            :, None, None, :
-        ]
-        
-        enable_gqa = q.size(1) != k.size(1)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k_cache, v_cache, attn_mask=mask, enable_gqa=enable_gqa
-        )
+        if paged_cache is not None:
+            
+            paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2))
+            max_key_length = paged_cache.get_max_k_cache_tokens()
+            mask = self.build_mask_from_index(token_counter, t_max = max_key_length )[
+                :,None, None, None, : 
+            ]
+            out = paged_sdpa(
+                q = q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , attn_mask = mask, paged_cache=paged_cache , max_key_length=max_key_length
+            )
+        else: # Normal Attention
+            assert k_cache is not None, "Error K_cache is none in normal attention"
+            assert v_cache is not None, "Error V_cache is none in normal attention"
+            
+            B = k_cache.size(0)
+            b_indices = torch.arange(B, device=k_cache.device)
+            k_cache[b_indices, :, token_counter.view(-1), :] = k[:, :, 0, :]
+            v_cache[b_indices, :, token_counter.view(-1), :] = v[:, :, 0, :]
+            mask = self.build_mask_from_index(token_counter, t_max=k_cache.size(-2))[
+                :, None, None, :
+            ]
+            
+            enable_gqa = q.size(1) != k.size(1)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k_cache, v_cache, attn_mask=mask, enable_gqa=enable_gqa
+            )
 
         return out
 
@@ -410,8 +432,9 @@ class CausalSelfAttention(nn.Module):
         v: torch.Tensor,  # B,nh,T,hs
         cos: torch.Tensor,
         sin: torch.Tensor,
-        k_cache: torch.Tensor,  # B,nh,t_max,hs
-        v_cache: torch.Tensor,  # B,nh,t_max,hs,
+        k_cache: Optional[torch.Tensor] = None,  # B,nh,t_max,hs
+        v_cache: Optional[torch.Tensor] = None,  # B,nh,t_max,hs
+        paged_cache: Optional["PagedKVCache"] = None
     ) -> torch.Tensor:
         B, T = q.shape[0], q.shape[-2]
         cos, sin = cos[:T], sin[:T]
@@ -431,11 +454,23 @@ class CausalSelfAttention(nn.Module):
             roped_tensors.append(roped)
 
         q, k = roped_tensors
-        k_cache[:, :, :T, :] = k[:, :, :T, :]
-        v_cache[:, :, :T, :] = v[:, :, :T, :]
+        
+        if paged_cache is not None:
+            
+            paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2))
+            max_key_length = paged_cache.get_max_k_cache_tokens()
+            
+            out = paged_sdpa(
+                q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , max_key_length, paged_cache , is_causal=True
+            )
+        else:
+            assert k_cache is not None, "Error K_cache is none in normal attention"
+            assert v_cache is not None, "Error V_cache is none in normal attention"
+            k_cache[:, :, :T, :] = k[:, :, :T, :]
+            v_cache[:, :, :T, :] = v[:, :, :T, :]
 
-        enable_gqa = q.size(1) != k.size(1)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+            enable_gqa = q.size(1) != k.size(1)
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
         return out
 
@@ -470,9 +505,9 @@ class CausalSelfAttention(nn.Module):
             self.config.rope_n_elem == self.config.head_size
         ), "partial rope is not supported yet"
 
-        k_cache, v_cache = self.kv_cache.k, self.kv_cache.v
 
         if self.config.explicitly_use_flash_kernel:
+            k_cache, v_cache = self.kv_cache.k, self.kv_cache.v
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
@@ -494,7 +529,38 @@ class CausalSelfAttention(nn.Module):
                     else (-1, -1)
                 ),
             )
+        # Maybe I could make this a smaller if branch
+        elif isinstance(self.kv_cache, PagedKVCache):
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+
+            if T == 1:
+                # generative phase
+                y = self.lit_rotary_kv_update_gen(
+                    q,
+                    k,
+                    v,
+                    cos,
+                    sin,
+                    token_counter,  # B,1
+                    paged_cache = self.kv_cache
+                )
+            else:
+                # prefill
+                y = self.lit_rotary_kv_update_prefill(
+                    q,
+                    k,
+                    v,
+                    cos,
+                    sin,
+                    paged_cache = self.kv_cache
+                )
+            y = y.transpose(1, 2).contiguous()
+            
+            
         else:
+            k_cache, v_cache = self.kv_cache.k, self.kv_cache.v
             q = q.transpose(1, 2).contiguous()
             k = k.transpose(1, 2).contiguous()
             v = v.transpose(1, 2).contiguous()
@@ -581,9 +647,16 @@ class CausalSelfAttention(nn.Module):
         rope_cache_length: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
-    ) -> "KVCache":
+        paged_attention_block_size: Optional[int] = None
+    ) -> Union["PagedKVCache", "KVCache"]:
 
         heads = self.config.n_query_groups
+        print(f"--------------------------{heads}")
+        if paged_attention_block_size is not None:
+            assert self.config.explicitly_use_flash_kernel == False, "Cannot use Flash Attention and Paged Attention at the same time"
+            return PagedKVCache(batch_size,paged_attention_block_size, heads, self.config.head_size, max_seq_length, device)
+        
+        
         if self.config.explicitly_use_flash_kernel:
             v_shape = (batch_size, max_seq_length, heads, self.config.head_size)
         else:
@@ -914,133 +987,8 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self) -> None:
         torch.nn.init.ones_(self.weight)
 
-class BlockTable:
-    def __init__(self, block_size:int ):
-        self.physical_block_values = []
-        self.filled = []
-        self.block_size = block_size
 
-class PagedKVCache:
-    def __init__(self, num_blocks: int, block_size: int, num_heads: int, head_dim: int, device="cuda"):
-        """
-        Initialize the blockd KV caching system.
 
-        Args:
-            # num_blocks (int): Number of blocks in the cache.
-            block_size (int): Number of tokens per block.
-            num_heads (int): Number of attention heads.
-            head_dim (int): Dimension of each attention head.
-            device (str): Device for cache storage.
-        """
-        # self.num_blocks = num_blocks
-        self.num_blocks = num_blocks
-        self.block_size = block_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.device = device
-        
-        # Initialize the cache and metadata
-        self.keys = torch.zeros(
-            (num_blocks, block_size, num_heads, head_dim), device=self.device
-        )
-        self.values = torch.zeros_like(self.keys)
-        self.block_usage = [None] * num_blocks  # Tracks usage of each block (None = free)
-        
-        self.block_tables = []
-    
-    def add_to_cache(self, k: torch.Tensor , v: torch.Tensor):
-        
-        for batch_id, k_batch in enumerate(k):
-            v_batch = v[batch_id]
-            tokens_to_save = k_batch.size(0)
-            if batch_id >= len(self.block_tables):
-                bt = BlockTable( self.block_size)
-                allocated_blocks, partial_index = self.allocate_blocks(tokens_to_save, bt)
-                self.block_tables.append(bt)
-            else:
-                bt = self.block_tables[batch_id]
-                allocated_blocks, partial_index = self.allocate_blocks(tokens_to_save, bt)
-                
-            # Take care of the partial block that needs to be filled here
-            if not partial_index == None:
-                num_filled_in_partial = bt.filled[partial_index] 
-                
-                partial_tokens_available = self.block_size - num_filled_in_partial
-                partial_tokens_to_write = min(partial_tokens_available, tokens_to_save)
-                partial_block_to_write = bt.physical_block_values[partial_index]
-                self.keys[partial_block_to_write, num_filled_in_partial: num_filled_in_partial + partial_tokens_to_write , :, :] = k_batch[0: partial_tokens_to_write, :, :]
-                self.values[partial_block_to_write, num_filled_in_partial: num_filled_in_partial + partial_tokens_to_write , :, :] = v_batch[0: partial_tokens_to_write, :, :]
-                
-                bt.filled[partial_index] += partial_tokens_to_write  # Updating the filled section of the last block
-                tokens_to_save -= partial_tokens_to_write
-
-            else:
-                partial_tokens_available = 0
-            
-            # Fill in the new blocks that have been allocated
-            if len(allocated_blocks) == 0:
-                # No new blocks needed; everything fit in partial block
-                continue
-            offset = partial_tokens_to_write
-
-            for al_block in allocated_blocks[:-1]:
-                self.keys[al_block, 0: self.block_size , :, :] = k_batch[offset: offset + self.block_size,:,:]
-                self.values[al_block, 0: self.block_size , :, :] = v_batch[offset: offset + self.block_size,:,:]
-                offset+= self.block_size
-                bt.physical_block_values.append(al_block)
-                bt.filled.append(self.block_size)
-            
-            self.keys[allocated_blocks[-1], 0:tokens_to_save-offset, :, : ] = k_batch[offset:tokens_to_save, :, :]
-            self.values[allocated_blocks[-1], 0:tokens_to_save-offset, :, : ] = v_batch[offset:tokens_to_save, :, :]
-            bt.physical_block_values.append(allocated_blocks[-1])
-            bt.filled.append(tokens_to_save-offset)
-                
-    def allocate_blocks(self, tokens_to_save, block_table: BlockTable):
-        
-          
-        free_blocks = [i  for i, usage in enumerate(self.block_usage) if usage is None ]
-        # already_present = self.block_size if block_table.filled == [] else block_table.filled[-1]
-        # num_blocks = (tokens_to_save + already_present - self.block_size)//self.block_size + 1
-        
-        if block_table.filled == []:
-            available_in_last_block = 0
-            partial_index = None
-        else:
-            available_in_last_block = self.block_size - block_table.filled[-1]
-            partial_index = len(block_table.filled)-1 if available_in_last_block >0 else None
-        
-        needed_tokens = max(0, tokens_to_save-available_in_last_block)
-        num_blocks = (needed_tokens + self.block_size -1)//self.block_size
-        
-        # If the number of free blocks is less than the number of new blocks needed
-        # We do the Eviction process
-        if len(free_blocks) < num_blocks:
-            num_evicted_blocks = num_blocks - len(free_blocks)
-            # clearing the least recently used num_evicted_blocks based on block_usage
-            sorted_blocks = sorted(enumerate(self.block_usage), key = lambda x: x[1])
-            for index, usage in sorted_blocks[:num_evicted_blocks]:
-                if self.block_usage[index] is not None:
-                    self.block_usage[index] = None
-                    free_blocks.append(index)
-                    num_evicted_blocks-=1
-                    if num_evicted_blocks==0: break
-                
-                
-        new_blocks = free_blocks[:num_blocks]
-        
-        
-        final_blocks = free_blocks[:num_blocks] 
-        for nb in new_blocks:
-            self.block_usage[nb] = torch.cuda.Event(enable_timing=True) # This is for the LRU eviction method
-        
-        return final_blocks, partial_index
-        
-       
-            
-        
-                    
-
-      
 
         
     

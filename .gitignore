@@ -2,5 +2,5 @@ __pycache__/
 
 
 *.sh
-external/
+external/checkpoints
 yalis/external/checkpoints/

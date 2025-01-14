@@ -68,7 +68,8 @@ if __name__ == "__main__":
     inference_config = InferenceConfig(batch_size=len(input_prompts), 
                                        max_length_of_generated_sequences=1024,
                                        top_p=0.80,
-                                       temperature=1.0)
+                                       temperature=1.0,
+                                       paged_attention_block_size = 64)
 
     engine = LLMEngine(model_config=model_config, inference_config=inference_config)
 
