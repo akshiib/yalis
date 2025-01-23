@@ -241,6 +241,7 @@ class LLMEngine:
                     )  # Call prefill function
                     # print_rank0(f"mem after prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")
                     current_input_to_model = next_token.clone()
+                    torch.compiler.cudagraph_mark_step_begin()
                 else:  # Generation step
                     with sdpa_kernel(SDPBackend.MATH):
                         next_token = generate(
@@ -254,6 +255,7 @@ class LLMEngine:
                         next_token
                     )  # Copy the new token into tokens
                 output_tokens.append(next_token.clone())
+                print("1 token generated sucessfully +++++++++++++++++++++++++++++++++++++++++")
         output_tensor = torch.cat(output_tokens, dim=1)
         # End timing and calculate elapsed time
         end.record()

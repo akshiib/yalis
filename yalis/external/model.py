@@ -52,7 +52,7 @@ class GPT(nn.Module):
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
                 h=nn.ModuleList(
-                    Block(config, block_idx) for block_idx in range(config.n_layer)
+                Block(config, block_idx) for block_idx in range(config.n_layer)
                 ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
@@ -295,21 +295,31 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, token_counter)
-        attention_output = self.post_attention_norm(attention_output)
 
+
+        attention_output = self.attn(x_normed, cos, sin, token_counter)
+        print_rank0(f"attention_output shape {attention_output.shape} ")
+        attention_output = self.post_attention_norm(attention_output)
+        # print("    ||||||||||||||||||||||||||||||||||||||||||||||||||||||||")
         if self.config.parallel_residual:
             x_normed = x_normed if self.config.shared_attention_norm else self.norm_2(x)
             x = self.mlp(x_normed) + attention_output + x
         else:
+            
+            print_rank0(f"x shape before {attention_output.shape} ")
             x = attention_output + x
+            print_rank0(f"x shape after 1 {attention_output.shape} ")
             x = self.post_mlp_norm(self.mlp(self.norm_2(x))) + x
+            print_rank0(f"x shape after 2 {attention_output.shape} ")
+        
         return x
 
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: Config, block_idx: int) -> None:
         super().__init__()
+        
+        self.block_idx = block_idx
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         if not config.tensor_parallel:
@@ -404,8 +414,8 @@ class CausalSelfAttention(nn.Module):
                 :,None, None, None, : 
             ]
             out = paged_sdpa(
-                q = q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , attn_mask = mask, paged_cache=paged_cache , max_key_length=max_key_length
-            )
+                q = q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , attn_mask = mask, paged_cache=paged_cache , max_key_length=max_key_length, is_causal= False, dropout_p=0.0
+            ).clone()
         else: # Normal Attention
             assert k_cache is not None, "Error K_cache is none in normal attention"
             assert v_cache is not None, "Error V_cache is none in normal attention"
@@ -458,17 +468,26 @@ class CausalSelfAttention(nn.Module):
         if paged_cache is not None:
             
             paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2))
+            
+            if self.block_idx == 30:
+                temp = paged_cache.keys[paged_cache.block_tables[0].physical_block_values[0]][:41]
+                print_rank0(f"{temp.shape}---{temp}")
+
             max_key_length = paged_cache.get_max_k_cache_tokens()
             
             out = paged_sdpa(
-                q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , max_key_length, paged_cache , is_causal=True
-            )
+                q = q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , max_key_length=max_key_length, paged_cache = paged_cache ,attn_mask= torch.zeros(1,1,1,1), is_causal=True, dropout_p=0.0
+            ).clone()
         else:
             assert k_cache is not None, "Error K_cache is none in normal attention"
             assert v_cache is not None, "Error V_cache is none in normal attention"
             k_cache[:, :, :T, :] = k[:, :, :T, :]
             v_cache[:, :, :T, :] = v[:, :, :T, :]
-
+            
+            if self.block_idx == 30:
+                temp = k_cache[0][:,:T,:].transpose(0,1)
+                print(f"{temp.shape}---{temp}")
+                
             enable_gqa = q.size(1) != k.size(1)
             out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
@@ -615,7 +634,7 @@ class CausalSelfAttention(nn.Module):
             )
             scores = q @ k.mT * scale
             scores = (
-                torch.tanh(scores / self.config.attention_logit_softcapping)
+            torch.tanh(scores / self.config.attention_logit_softcapping)
                 * self.config.attention_logit_softcapping
             )
             if mask is None:
@@ -651,10 +670,9 @@ class CausalSelfAttention(nn.Module):
     ) -> Union["PagedKVCache", "KVCache"]:
 
         heads = self.config.n_query_groups
-        print(f"--------------------------{heads}")
         if paged_attention_block_size is not None:
             assert self.config.explicitly_use_flash_kernel == False, "Cannot use Flash Attention and Paged Attention at the same time"
-            return PagedKVCache(batch_size,paged_attention_block_size, heads, self.config.head_size, max_seq_length, device)
+            return PagedKVCache(batch_size,paged_attention_block_size, heads, self.config.head_size, max_seq_length,dtype, device )
         
         
         if self.config.explicitly_use_flash_kernel:

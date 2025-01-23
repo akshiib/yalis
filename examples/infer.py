@@ -44,7 +44,7 @@ if __name__ == "__main__":
     system_prompt = "You are a helpful chatbot. Answer the following question.\n"
 
     # profile the run or not
-    enable_profiling = True
+    enable_profiling = False
 
     # Tokenizer for encoding the prompt
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -61,7 +61,7 @@ if __name__ == "__main__":
         input_prompts.append(formatted_prompt)
 
     # Number of tokens to generate
-    tokens_to_gen = 512
+    tokens_to_gen = 1
 
     # configs
     model_config = ModelConfig(model_name=model_id, precision="bf16")
@@ -69,7 +69,8 @@ if __name__ == "__main__":
                                        max_length_of_generated_sequences=1024,
                                        top_p=0.80,
                                        temperature=1.0,
-                                       paged_attention_block_size = 64)
+                                       paged_attention_block_size = 64
+                                       )
 
     engine = LLMEngine(model_config=model_config, inference_config=inference_config)
 
@@ -82,7 +83,7 @@ if __name__ == "__main__":
         profiler_context = nullcontext()
 
     with profiler_context as prof:
-        for iter in range(8):
+        for iter in range(1):
             output_tokens = engine.generate(
                 input_prompts, report_throughput=True, tokens_to_generate=tokens_to_gen
             )
