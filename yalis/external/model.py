@@ -411,10 +411,10 @@ class CausalSelfAttention(nn.Module):
             paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2))
             max_key_length = paged_cache.get_max_k_cache_tokens()
             mask = self.build_mask_from_index(token_counter, t_max = max_key_length )[
-                :,None, None, None, : 
+                :,None, None, : 
             ]
             out = paged_sdpa(
-                q = q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , attn_mask = mask, paged_cache=paged_cache , max_key_length=max_key_length, is_causal= False, dropout_p=0.0
+                q = q , attn_mask = mask, paged_cache=paged_cache , max_key_length=max_key_length, is_causal= False, dropout_p=0.0
             ).clone()
         else: # Normal Attention
             assert k_cache is not None, "Error K_cache is none in normal attention"
@@ -476,7 +476,7 @@ class CausalSelfAttention(nn.Module):
             max_key_length = paged_cache.get_max_k_cache_tokens()
             
             out = paged_sdpa(
-                q = q.view(B, -1, self.config.n_query_groups, T, q.shape[-1]) , max_key_length=max_key_length, paged_cache = paged_cache ,attn_mask= torch.zeros(1,1,1,1), is_causal=True, dropout_p=0.0
+                q = q , max_key_length=max_key_length, paged_cache = paged_cache ,attn_mask= torch.zeros(1,1,1,1), is_causal=True, dropout_p=0.0
             ).clone()
         else:
             assert k_cache is not None, "Error K_cache is none in normal attention"
