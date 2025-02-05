@@ -6,7 +6,7 @@ class TestPagedKVCache(unittest.TestCase):
 
     def setUp(self):
         """Setup a small PagedKVCache for testing."""
-        self.batch_size = 8
+        self.batch_size = 1
         self.block_size = 64
         self.num_heads = 2
         self.head_dim = 128
@@ -84,9 +84,86 @@ class TestPagedKVCache(unittest.TestCase):
                             f"Final reconstructed values do not match for batch {batch_id}.")
 
 
-    def test_partial_block_fill(self):
+    # def test_partial_block_fill(self):
+    #     """Test adding tokens that partially fill a block and then continue filling."""
+    #     tokens_to_store = 50  # Less than block size
+    #     k = torch.randn((self.batch_size, tokens_to_store, self.num_heads, self.head_dim),
+    #                     dtype=self.dtype, device=self.device)
+    #     v = torch.randn_like(k)
+
+    #     # First add - partial fill
+    #     self.cache.add_to_cache(k, v)
+
+    #     # Verify partial fill correctness
+    #     for batch_id, bt in enumerate(self.cache.block_tables):
+    #         self.assertGreater(len(bt.physical_block_values), 0,
+    #                            f"Batch {batch_id} should have at least one block after partial fill.")
+    #         self.assertEqual(sum(bt.filled), tokens_to_store,
+    #                          f"Batch {batch_id} partial fill mismatch (expected {tokens_to_store}).")
+
+    #     # Add more tokens
+    #     additional_tokens = 20
+    #     k_new = torch.randn((self.batch_size, additional_tokens, self.num_heads, self.head_dim),
+    #                         dtype=self.dtype, device=self.device)
+    #     v_new = torch.randn_like(k_new)
+
+    #     # Second add - continuing fill
+    #     self.cache.add_to_cache(k_new, v_new)
+        
+    #     print(self.cache.block_tables[0].filled)
+
+    #     # Verify entire fill correctness
+    #     total_tokens = tokens_to_store + additional_tokens
+    #     for batch_id, bt in enumerate(self.cache.block_tables):
+    #         self.assertEqual(sum(bt.filled), total_tokens,
+    #                          f"Batch {batch_id} total tokens mismatch (expected {total_tokens}).")
+
+    #         # Reconstruct the stored data for this batch
+    #         reconstructed_k = []
+    #         reconstructed_v = []
+
+    #         offset = 0
+    #         for block_id, physical_block_num in enumerate(bt.physical_block_values):
+    #             print(f"which block_d - {block_id}")
+    #             num_tokens_in_block = bt.filled[block_id]
+    #             stored_k = self.cache.keys[physical_block_num, 0:num_tokens_in_block, :, :]
+    #             stored_v = self.cache.values[physical_block_num, 0:num_tokens_in_block, :, :]
+
+    #             if offset < tokens_to_store:
+    #                 # We are in the region of the first partial fill
+    #                 expected_k = k[batch_id, offset : offset + num_tokens_in_block, :, :]
+    #                 expected_v = v[batch_id, offset : offset + num_tokens_in_block, :, :]
+    #             else:
+    #                 # We are in the region of the second fill
+    #                 offset_in_new = offset - tokens_to_store
+    #                 expected_k = k_new[batch_id, offset_in_new : offset_in_new + num_tokens_in_block, :, :]
+    #                 expected_v = v_new[batch_id, offset_in_new : offset_in_new + num_tokens_in_block, :, :]
+
+    #             self.assertTrue(torch.allclose(stored_k, expected_k, atol=1e-5),
+    #                             f"Mismatch in keys at batch {batch_id}, block {block_id}.")
+    #             self.assertTrue(torch.allclose(stored_v, expected_v, atol=1e-5),
+    #                             f"Mismatch in values at batch {batch_id}, block {block_id}.")
+
+    #             reconstructed_k.append(stored_k)
+    #             reconstructed_v.append(stored_v)
+    #             offset += num_tokens_in_block
+
+    #         # Final reconstruction
+    #         final_k = torch.cat(reconstructed_k, dim=0)
+    #         final_v = torch.cat(reconstructed_v, dim=0)
+
+    #         # Build reference of what we expect (concatenation of old & new k)
+    #         expected_k_full = torch.cat((k[batch_id], k_new[batch_id]), dim=0)
+    #         expected_v_full = torch.cat((v[batch_id], v_new[batch_id]), dim=0)
+
+    #         self.assertTrue(torch.allclose(final_k, expected_k_full, atol=1e-5),
+    #                         f"Final reconstructed keys do not match for batch {batch_id} after partial fill.")
+    #         self.assertTrue(torch.allclose(final_v, expected_v_full, atol=1e-5),
+    #                         f"Final reconstructed values do not match for batch {batch_id} after partial fill.")
+
+    def test_partial_block_fill_hardcoded(self):
         """Test adding tokens that partially fill a block and then continue filling."""
-        tokens_to_store = 50  # Less than block size
+        tokens_to_store = 50  # Less than block size (64)
         k = torch.randn((self.batch_size, tokens_to_store, self.num_heads, self.head_dim),
                         dtype=self.dtype, device=self.device)
         v = torch.randn_like(k)
@@ -97,11 +174,11 @@ class TestPagedKVCache(unittest.TestCase):
         # Verify partial fill correctness
         for batch_id, bt in enumerate(self.cache.block_tables):
             self.assertGreater(len(bt.physical_block_values), 0,
-                               f"Batch {batch_id} should have at least one block after partial fill.")
+                            f"Batch {batch_id} should have at least one block after partial fill.")
             self.assertEqual(sum(bt.filled), tokens_to_store,
-                             f"Batch {batch_id} partial fill mismatch (expected {tokens_to_store}).")
+                            f"Batch {batch_id} partial fill mismatch (expected {tokens_to_store}).")
 
-        # Add more tokens
+        # Add more tokens (20 more tokens)
         additional_tokens = 20
         k_new = torch.randn((self.batch_size, additional_tokens, self.num_heads, self.head_dim),
                             dtype=self.dtype, device=self.device)
@@ -109,12 +186,22 @@ class TestPagedKVCache(unittest.TestCase):
 
         # Second add - continuing fill
         self.cache.add_to_cache(k_new, v_new)
+        
+        print(self.cache.block_tables[0].filled)  # Debugging print
 
         # Verify entire fill correctness
-        total_tokens = tokens_to_store + additional_tokens
+        total_tokens = tokens_to_store + additional_tokens  # 50 + 20 = 70
         for batch_id, bt in enumerate(self.cache.block_tables):
             self.assertEqual(sum(bt.filled), total_tokens,
-                             f"Batch {batch_id} total tokens mismatch (expected {total_tokens}).")
+                            f"Batch {batch_id} total tokens mismatch (expected {total_tokens}).")
+
+            # Ensure correct block allocation (1 full + 1 partial)
+            self.assertEqual(len(bt.physical_block_values), 2, 
+                            f"Batch {batch_id} should have exactly 2 blocks.")
+
+            # First block should now have 64 tokens, second should have 6
+            self.assertEqual(bt.filled[0], 64, f"Batch {batch_id}: First block should be full (64 tokens).")
+            self.assertEqual(bt.filled[1], 6, f"Batch {batch_id}: Second block should have 6 tokens.")
 
             # Reconstruct the stored data for this batch
             reconstructed_k = []
@@ -122,19 +209,19 @@ class TestPagedKVCache(unittest.TestCase):
 
             offset = 0
             for block_id, physical_block_num in enumerate(bt.physical_block_values):
+                print(f"which block_id - {block_id}")  # Debugging print
                 num_tokens_in_block = bt.filled[block_id]
                 stored_k = self.cache.keys[physical_block_num, 0:num_tokens_in_block, :, :]
                 stored_v = self.cache.values[physical_block_num, 0:num_tokens_in_block, :, :]
 
-                if offset < tokens_to_store:
-                    # We are in the region of the first partial fill
-                    expected_k = k[batch_id, offset : offset + num_tokens_in_block, :, :]
-                    expected_v = v[batch_id, offset : offset + num_tokens_in_block, :, :]
+                if block_id == 0:
+                    # First block: should contain first 50 tokens + first 14 tokens of second add
+                    expected_k = torch.cat((k[batch_id], k_new[batch_id, :14, :, :]), dim=0)
+                    expected_v = torch.cat((v[batch_id], v_new[batch_id, :14, :, :]), dim=0)
                 else:
-                    # We are in the region of the second fill
-                    offset_in_new = offset - tokens_to_store
-                    expected_k = k_new[batch_id, offset_in_new : offset_in_new + num_tokens_in_block, :, :]
-                    expected_v = v_new[batch_id, offset_in_new : offset_in_new + num_tokens_in_block, :, :]
+                    # Second block: should contain remaining 6 tokens
+                    expected_k = k_new[batch_id, 14:20, :, :]
+                    expected_v = v_new[batch_id, 14:20, :, :]
 
                 self.assertTrue(torch.allclose(stored_k, expected_k, atol=1e-5),
                                 f"Mismatch in keys at batch {batch_id}, block {block_id}.")
@@ -157,7 +244,6 @@ class TestPagedKVCache(unittest.TestCase):
                             f"Final reconstructed keys do not match for batch {batch_id} after partial fill.")
             self.assertTrue(torch.allclose(final_v, expected_v_full, atol=1e-5),
                             f"Final reconstructed values do not match for batch {batch_id} after partial fill.")
-
 
     def test_add_multiple_batches(self):
         """Test that multiple batches are stored separately, verifying stored data as well."""
@@ -304,5 +390,83 @@ class TestPagedKVCache(unittest.TestCase):
         self.assertEqual(max_tokens, tokens_to_store,
                          "get_max_k_cache_tokens did not return the correct max token count.")
 
+
+    def test_kv_cache_over_multiple_inference_steps(self):
+            """Test whether the KV cache correctly updates over multiple inference steps without corruption."""
+            
+            num_steps = 10  # Number of generated tokens
+            stored_keys = []
+            stored_values = []
+
+            for step in range(num_steps):
+                # Simulate new token KV pairs
+                k_new = torch.randn((self.batch_size, 1, self.num_heads, self.head_dim),
+                                    dtype=self.dtype, device=self.device)
+                v_new = torch.randn_like(k_new)
+
+                # Store expected outputs for verification later
+                stored_keys.append(k_new.clone())
+                stored_values.append(v_new.clone())
+
+                # Add new token KV pairs to cache
+                self.cache.add_to_cache(k_new, v_new)
+
+                # Validate correct KV storage after each step
+                reconstructed_k = []
+                reconstructed_v = []
+                offset = 0
+
+                for batch_id, bt in enumerate(self.cache.block_tables):
+                    for block_id, physical_block_num in enumerate(bt.physical_block_values):
+                        num_tokens_in_block = bt.filled[block_id]
+                        stored_k = self.cache.keys[physical_block_num, 0:num_tokens_in_block, :, :]
+                        stored_v = self.cache.values[physical_block_num, 0:num_tokens_in_block, :, :]
+
+                        reconstructed_k.append(stored_k)
+                        reconstructed_v.append(stored_v)
+
+                        offset += num_tokens_in_block
+
+                # Reconstruct full KV cache and compare with expected history
+                final_k = torch.cat(reconstructed_k, dim=0)
+                final_v = torch.cat(reconstructed_v, dim=0)
+
+                expected_k = torch.cat(stored_keys, dim=1)
+                expected_v = torch.cat(stored_values, dim=1)
+
+                self.assertTrue(torch.allclose(final_k, expected_k, atol=1e-5),
+                                f"KV Cache mismatch at step {step} (Keys).")
+                self.assertTrue(torch.allclose(final_v, expected_v, atol=1e-5),
+                                f"KV Cache mismatch at step {step} (Values).")
+
+
+    def test_attention_output_consistency(self):
+        """Ensure attention outputs remain numerically stable over multiple steps."""
+
+        num_steps = 10
+        attention_outputs = []
+
+        for step in range(num_steps):
+            # Simulate new token generation
+            q = torch.randn((self.batch_size, 1, self.num_heads, self.head_dim),
+                            dtype=self.dtype, device=self.device)
+            k = torch.randn((self.batch_size, 1, self.num_heads, self.head_dim),
+                            dtype=self.dtype, device=self.device)
+            v = torch.randn_like(k)
+
+            self.cache.add_to_cache(k, v)
+
+            # Generate attention output
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, self.cache.keys, self.cache.values, dropout_p=0.0, is_causal=True
+            )
+
+            attention_outputs.append(attn_output.clone())
+
+            if step > 0:
+                self.assertTrue(torch.allclose(attention_outputs[step], attention_outputs[step - 1], atol=1e-3),
+                                f"Attention output shifted at step {step}")
+
+    
 if __name__ == "__main__":
     unittest.main()

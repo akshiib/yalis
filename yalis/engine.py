@@ -17,6 +17,7 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 torch._inductor.config.assert_indirect_indexing = False
+torch._dynamo.config.capture_scalar_outputs = True
 
 precision_to_dtype = {
     "bf16": torch.bfloat16,
@@ -61,6 +62,7 @@ def generate(model, tokens, get_probs=False, temperature=1.0, top_k=None, top_p=
         token_id: The next predicted token.
         logits: (Optional) The raw logits from the model.
     """
+    print("Starting decode -----------------------------------------------------")
     logits = model(tokens)["logits"]
     token_id = sample(logits=logits[:, -1], temperature=temperature, top_k=top_k, top_p=top_p)
     if get_probs:
@@ -233,15 +235,17 @@ class LLMEngine:
             for step in range(tokens_to_generate):
                 if step == 0:  # Prefill step
                     # print_rank0(f"mem before prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-                    next_token = prefill(
-                        self.model, current_input_to_model, prompt_sequence_lengths, 
-                        temperature=self.inference_config.temperature, 
-                        top_k=self.inference_config.top_k, 
-                        top_p=self.inference_config.top_p
-                    )  # Call prefill function
-                    # print_rank0(f"mem after prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                    with sdpa_kernel(SDPBackend.MATH):
+
+                        next_token = prefill(
+                            self.model, current_input_to_model, prompt_sequence_lengths, 
+                            temperature=self.inference_config.temperature, 
+                            top_k=self.inference_config.top_k, 
+                            top_p=self.inference_config.top_p
+                        )  # Call prefill function
+                        # print_rank0(f"mem after prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")
                     current_input_to_model = next_token.clone()
-                    torch.compiler.cudagraph_mark_step_begin()
+                    # torch.compiler.cudagraph_mark_step_begin()
                 else:  # Generation step
                     with sdpa_kernel(SDPBackend.MATH):
                         next_token = generate(
@@ -255,8 +259,9 @@ class LLMEngine:
                         next_token
                     )  # Copy the new token into tokens
                 output_tokens.append(next_token.clone())
-                print("1 token generated sucessfully +++++++++++++++++++++++++++++++++++++++++")
+                # print("1 token generated sucessfully +++++++++++++++++++++++++++++++++++++++++")
         output_tensor = torch.cat(output_tokens, dim=1)
+        self.model.reset_paged_cache()
         # End timing and calculate elapsed time
         end.record()
         torch.cuda.synchronize()  # Wait for all events to finish

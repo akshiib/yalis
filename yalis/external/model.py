@@ -33,7 +33,6 @@ from axonn.intra_layer.communication import Drop, Gather
 
 
 
-
 class GPT(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -102,6 +101,7 @@ class GPT(nn.Module):
     def forward(
         self, input_ids: torch.Tensor, actual_sequence_lengths: torch.Tensor = None
     ) -> torch.Tensor:
+        
         # assert attention_mask is None, "litgpt model does not accept an attention mask"
         idx = input_ids
         T = idx.size(1)
@@ -124,7 +124,7 @@ class GPT(nn.Module):
             self.sin = self.sin.to(x.dtype)
 
         for block in self.transformer.h:
-            x = block(x, self.cos, self.sin, self.token_counter)
+            x = block(x, self.cos, self.sin, self.token_counter, actual_sequence_lengths)
         if self.config.tensor_parallel:
             x = Gather.apply(x, ax.comm_handle.inner_intra_layer_parallel_group)
         x = self.transformer.ln_f(x)
@@ -229,10 +229,17 @@ class GPT(nn.Module):
             )
 
         self.token_counter = torch.zeros(batch_size, device=device, dtype=torch.int32)
+        
 
     def clear_kv_cache(self) -> None:
         for block in self.transformer.h:
             block.attn.kv_cache = None
+    
+    def reset_paged_cache(self) -> None:
+        for block in self.transformer.h:
+            if isinstance(block.attn.kv_cache, PagedKVCache):
+                
+                block.attn.kv_cache.reset()
 
 
 class Block(nn.Module):
@@ -272,6 +279,7 @@ class Block(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         token_counter: Optional[torch.Tensor] = None,
+        initial_prompt_lengths: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -297,20 +305,15 @@ class Block(nn.Module):
         x_normed = self.norm_1(x)
 
 
-        attention_output = self.attn(x_normed, cos, sin, token_counter)
-        print_rank0(f"attention_output shape {attention_output.shape} ")
-        attention_output = self.post_attention_norm(attention_output)
-        # print("    ||||||||||||||||||||||||||||||||||||||||||||||||||||||||")
+        attention_output = self.attn(x_normed, cos, sin, token_counter, initial_prompt_lengths)
+        attention_output = self.post_attention_norm(attention_output) 
         if self.config.parallel_residual:
             x_normed = x_normed if self.config.shared_attention_norm else self.norm_2(x)
             x = self.mlp(x_normed) + attention_output + x
         else:
             
-            print_rank0(f"x shape before {attention_output.shape} ")
             x = attention_output + x
-            print_rank0(f"x shape after 1 {attention_output.shape} ")
             x = self.post_mlp_norm(self.mlp(self.norm_2(x))) + x
-            print_rank0(f"x shape after 2 {attention_output.shape} ")
         
         return x
 
@@ -342,6 +345,8 @@ class CausalSelfAttention(nn.Module):
             )
         # disabled by default
         self.kv_cache: KVCache | PagedKVCache | None = None
+        
+        
         self.apply_sliding_window_attention = (
             config.sliding_window_size is not None
             and block_idx % config.sliding_window_layer_placing == 0
@@ -408,14 +413,18 @@ class CausalSelfAttention(nn.Module):
 
         if paged_cache is not None:
             
-            paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2))
-            max_key_length = paged_cache.get_max_k_cache_tokens()
+            paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2), token_counter = token_counter)
+            
+            
+            max_key_length = paged_cache.max_sequence_length
             mask = self.build_mask_from_index(token_counter, t_max = max_key_length )[
                 :,None, None, : 
             ]
+            
             out = paged_sdpa(
                 q = q , attn_mask = mask, paged_cache=paged_cache , max_key_length=max_key_length, is_causal= False, dropout_p=0.0
             ).clone()
+            
         else: # Normal Attention
             assert k_cache is not None, "Error K_cache is none in normal attention"
             assert v_cache is not None, "Error V_cache is none in normal attention"
@@ -424,6 +433,7 @@ class CausalSelfAttention(nn.Module):
             b_indices = torch.arange(B, device=k_cache.device)
             k_cache[b_indices, :, token_counter.view(-1), :] = k[:, :, 0, :]
             v_cache[b_indices, :, token_counter.view(-1), :] = v[:, :, 0, :]
+          
             mask = self.build_mask_from_index(token_counter, t_max=k_cache.size(-2))[
                 :, None, None, :
             ]
@@ -432,6 +442,9 @@ class CausalSelfAttention(nn.Module):
             out = torch.nn.functional.scaled_dot_product_attention(
                 q, k_cache, v_cache, attn_mask=mask, enable_gqa=enable_gqa
             )
+            
+            
+
 
         return out
 
@@ -442,6 +455,7 @@ class CausalSelfAttention(nn.Module):
         v: torch.Tensor,  # B,nh,T,hs
         cos: torch.Tensor,
         sin: torch.Tensor,
+        initial_prompt_lengths:torch.Tensor = None,
         k_cache: Optional[torch.Tensor] = None,  # B,nh,t_max,hs
         v_cache: Optional[torch.Tensor] = None,  # B,nh,t_max,hs
         paged_cache: Optional["PagedKVCache"] = None
@@ -467,30 +481,25 @@ class CausalSelfAttention(nn.Module):
         
         if paged_cache is not None:
             
-            paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2))
-            
-            if self.block_idx == 30:
-                temp = paged_cache.keys[paged_cache.block_tables[0].physical_block_values[0]][:41]
-                print_rank0(f"{temp.shape}---{temp}")
+            paged_cache.add_to_cache(k.transpose(1,2),v.transpose(1,2), initial_prompt_lengths=initial_prompt_lengths )
 
-            max_key_length = paged_cache.get_max_k_cache_tokens()
-            
             out = paged_sdpa(
-                q = q , max_key_length=max_key_length, paged_cache = paged_cache ,attn_mask= torch.zeros(1,1,1,1), is_causal=True, dropout_p=0.0
-            ).clone()
+                q = q , max_key_length = T, paged_cache = paged_cache ,attn_mask= torch.zeros(1,1,1,1), is_causal=True, dropout_p=0.0
+            )
+            
         else:
+            
             assert k_cache is not None, "Error K_cache is none in normal attention"
             assert v_cache is not None, "Error V_cache is none in normal attention"
+            
             k_cache[:, :, :T, :] = k[:, :, :T, :]
             v_cache[:, :, :T, :] = v[:, :, :T, :]
-            
-            if self.block_idx == 30:
-                temp = k_cache[0][:,:T,:].transpose(0,1)
-                print(f"{temp.shape}---{temp}")
+                
                 
             enable_gqa = q.size(1) != k.size(1)
-            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-
+           
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)        
+        
         return out
 
     def forward(
@@ -499,6 +508,7 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         token_counter: torch.Tensor,
+        initial_prompt_lengths:Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         B, T, C = (
             x.size()
@@ -563,17 +573,21 @@ class CausalSelfAttention(nn.Module):
                     cos,
                     sin,
                     token_counter,  # B,1
-                    paged_cache = self.kv_cache
-                )
+                    paged_cache = self.kv_cache,
+                    
+                ) 
             else:
                 # prefill
+                assert initial_prompt_lengths is not None, "Initial lengths cannot be None for Prefill method with Paged KV Caching"
                 y = self.lit_rotary_kv_update_prefill(
                     q,
                     k,
                     v,
                     cos,
                     sin,
-                    paged_cache = self.kv_cache
+                    paged_cache = self.kv_cache,
+                    initial_prompt_lengths=initial_prompt_lengths
+                    
                 )
             y = y.transpose(1, 2).contiguous()
             
@@ -593,8 +607,8 @@ class CausalSelfAttention(nn.Module):
                     cos,
                     sin,
                     token_counter,  # B,1
-                    k_cache,  # B,nh,t_max,hs
-                    v_cache,  # B,nh,t_max,hs
+                    k_cache = k_cache,  # B,nh,t_max,hs
+                    v_cache = v_cache,  # B,nh,t_max,hs
                 )
             else:
                 # prefill
@@ -604,8 +618,8 @@ class CausalSelfAttention(nn.Module):
                     v,
                     cos,
                     sin,
-                    k_cache,  # B,nh,t_max,hs
-                    v_cache,  # B,nh,t_max,hs
+                    k_cache = k_cache,  # B,nh,t_max,hs
+                    v_cache = v_cache,  # B,nh,t_max,hs
                 )
             y = y.transpose(1, 2).contiguous()
 
@@ -670,9 +684,7 @@ class CausalSelfAttention(nn.Module):
     ) -> Union["PagedKVCache", "KVCache"]:
 
         heads = self.config.n_query_groups
-        if paged_attention_block_size is not None:
-            assert self.config.explicitly_use_flash_kernel == False, "Cannot use Flash Attention and Paged Attention at the same time"
-            return PagedKVCache(batch_size,paged_attention_block_size, heads, self.config.head_size, max_seq_length,dtype, device )
+             
         
         
         if self.config.explicitly_use_flash_kernel:
@@ -701,6 +713,11 @@ class CausalSelfAttention(nn.Module):
                     max_seq_length,
                     rope_cache_length + self.config.head_size - self.config.rope_n_elem,
                 )
+        
+        if paged_attention_block_size is not None:
+            assert self.config.explicitly_use_flash_kernel == False, "Cannot use Flash Attention and Paged Attention at the same time"
+            return PagedKVCache(k_shape, v_shape, batch_size,paged_attention_block_size, heads, rope_cache_length + self.config.head_size - self.config.rope_n_elem, max_seq_length,dtype, device )
+        
 
         return KVCache(k_shape, v_shape, device=device, dtype=dtype)
 

@@ -69,7 +69,7 @@ if __name__ == "__main__":
                                        max_length_of_generated_sequences=1024,
                                        top_p=0.80,
                                        temperature=1.0,
-                                       paged_attention_block_size = 64
+                                    #    paged_attention_block_size = 64
                                        )
 
     engine = LLMEngine(model_config=model_config, inference_config=inference_config)
@@ -83,10 +83,11 @@ if __name__ == "__main__":
         profiler_context = nullcontext()
 
     with profiler_context as prof:
-        for iter in range(1):
+        for iter in range(4):
             output_tokens = engine.generate(
                 input_prompts, report_throughput=True, tokens_to_generate=tokens_to_gen
             )
+
             if enable_profiling:
                 prof.step()
             dist.barrier()
