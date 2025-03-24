@@ -27,7 +27,7 @@ precision_to_dtype = {
 
 
 @torch.no_grad()
-@torch.compile()
+@torch.compile(dynamic=True)
 def prefill(model, tokens, unpadded_prompt_lengths, temperature=1.0, top_k=None, top_p=1.0):
     """
     Prefill function for generating the first token.
@@ -47,7 +47,7 @@ def prefill(model, tokens, unpadded_prompt_lengths, temperature=1.0, top_k=None,
 
 
 @torch.no_grad()
-@torch.compile(mode="reduce-overhead")
+@torch.compile(mode="reduce-overhead", dynamic=True)
 def generate(model, tokens, get_probs=False, temperature=1.0, top_k=None, top_p=1.0):
     """
     Generate function for producing the next token(s).
@@ -234,7 +234,6 @@ class LLMEngine:
             prompt_sequence_lengths = prompt_sequence_lengths.to(self.device)
             for step in range(tokens_to_generate):
                 if step == 0:  # Prefill step
-                    # print_rank0(f"mem before prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")
                     with sdpa_kernel(SDPBackend.MATH):
 
                         next_token = prefill(
@@ -245,7 +244,6 @@ class LLMEngine:
                         )  # Call prefill function
                         # print_rank0(f"mem after prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")
                     current_input_to_model = next_token.clone()
-                    # torch.compiler.cudagraph_mark_step_begin()
                 else:  # Generation step
                     with sdpa_kernel(SDPBackend.MATH):
                         next_token = generate(
@@ -259,7 +257,6 @@ class LLMEngine:
                         next_token
                     )  # Copy the new token into tokens
                 output_tokens.append(next_token.clone())
-                # print("1 token generated sucessfully +++++++++++++++++++++++++++++++++++++++++")
         output_tensor = torch.cat(output_tokens, dim=1)
         self.model.reset_paged_cache()
         # End timing and calculate elapsed time

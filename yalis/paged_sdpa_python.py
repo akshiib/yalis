@@ -60,11 +60,11 @@ class PagedKVCache(nn.Module):
         self.filled = torch.zeros(
             (self.num_blocks,), device = self.device, dtype=torch.int32
         )
-        self.block_usage  = [None] * self.num_blocks
+        self.block_usage  = torch.full((self.num_blocks,), -1, device = self.device, dtype = torch.int32)
         self.block_tables : List[self.BlockTable] = []
         
-    def get_max_k_cache_tokens(self)->int:
-        return max(sum([self.filled[b_num] for b_num in bt.filled]) for bt in self.block_tables)
+    # def get_max_k_cache_tokens(self)->int:
+    #     return max(sum([self.filled[b_num] for b_num in bt.filled]) for bt in self.block_tables)
 
     
   
@@ -72,7 +72,7 @@ class PagedKVCache(nn.Module):
     def add_to_cache(self, k: torch.Tensor , v: torch.Tensor, token_counter:torch.Tensor = None, initial_prompt_lengths:torch.Tensor = None):
         B, T = k.size(0), k.size(1)
         tokens_to_save = T
-        partial_indices, full_blocks, final_blocks = self.allocate_blocks_new(tokens_to_save, token_counter, initial_prompt_lengths)
+        partial_indices, full_blocks, final_blocks = self.allocate_blocks(tokens_to_save, token_counter, initial_prompt_lengths)
         
         # Carrying out the vectorized partial_index filling section (noit done during prefill - only done during the decode  or generate process)
         
@@ -113,7 +113,7 @@ class PagedKVCache(nn.Module):
         
         valid_final_mask = final_blocks != -1
         if valid_final_mask.any():
-            batch_indices = torch.arange(B, device = self.device)
+            batch_indices = torch.arange((B,), device = self.device)
             valid_final_batch_indices = batch_indices[valid_final_mask]
             valid_final_block_indices = final_blocks[valid_final_mask]
             if isinstance(tokens_to_save, torch.Tensor): tokens_to_save = max(tokens_to_save[valid_final_mask])
@@ -127,13 +127,11 @@ class PagedKVCache(nn.Module):
     def allocate_blocks(self, tokens_to_save, token_counter: torch.Tensor = None, initial_prompt_lengths:torch.Tensor = None):
         
         B = self.batch_size
-        final_blocks = torch.full((B,),-1, device = self.device)
-        full_blocks = torch.full((B, self.block_size), -1, device = self.device)
-        partial_indices = torch.full((B,), -1, device = self.device)
         final_blocks = []
         full_blocks = []
         partial_indices = []
-        free_blocks = [i  for i, usage in enumerate(self.block_usage) if usage is None ]
+
+        free_blocks = [i for i, usage in enumerate(self.block_usage) if usage == -1]
         for batch_id in range(B):
             
             if batch_id >= len(self.block_tables):
@@ -155,30 +153,32 @@ class PagedKVCache(nn.Module):
             num_blocks = (needed_tokens + self.block_size -1)//self.block_size
             
             
-            if len(free_blocks) < num_blocks:
-                num_evicted_blocks = num_blocks - len(free_blocks)
-                # clearing the least recently used num_evicted_blocks based on block_usage
-                sorted_blocks = sorted(enumerate(self.block_usage), key = lambda x: x[1])
-                for index, usage in sorted_blocks[:num_evicted_blocks]:
-                    if self.block_usage[index] is not None:
-                        self.block_usage[index] = None
-                        free_blocks.append(index)
-                        num_evicted_blocks-=1
-                        if num_evicted_blocks==0: break
+            # if len(free_blocks) < num_blocks:
+            #     num_evicted_blocks = num_blocks - len(free_blocks)
+            #     # clearing the least recently used num_evicted_blocks based on block_usage
+            #     sorted_blocks = sorted(enumerate(self.block_usage), key = lambda x: x[1])
+            #     for index, usage in sorted_blocks[:num_evicted_blocks]:
+            #         if self.block_usage[index] is not None:
+            #             self.block_usage[index] = None
+            #             free_blocks.append(index)
+            #             num_evicted_blocks-=1
+            #             if num_evicted_blocks==0: break
                     
                     
             new_blocks = free_blocks[:num_blocks]
             free_blocks = free_blocks[num_blocks:]
             
-            for nb in new_blocks:
-                self.block_usage[nb] = torch.cuda.Event(enable_timing=True) 
+            self.block_usage[new_blocks] = 1
             
             partial_indices.append(partial_index)
             full_blocks.append(new_blocks[:-1])
             final_blocks.append(new_blocks[-1] if len(new_blocks) >0 else -1)
             
             actual_num_blocks_needed = (initial_prompt_lengths[batch_id] +self.block_size-1)//self.block_size if initial_prompt_lengths is not None else num_blocks
-            block_table.physical_block_values[block_table.num_valid_blocks: block_table.num_valid_blocks + actual_num_blocks_needed] = torch.tensor(new_blocks[:actual_num_blocks_needed], device = self.device)
+            
+            update_physical_blocks_dynamo_friendly_tensor = torch.arange(block_table.num_valid_blocks, block_table.num_valid_blocks + actual_num_blocks_needed, dtype = torch.int32, device = self.device)
+            
+            block_table.physical_block_values[update_physical_blocks_dynamo_friendly_tensor] = torch.tensor(new_blocks[:actual_num_blocks_needed], device = self.device, dtype=torch.int32)
             block_table.num_valid_blocks+= actual_num_blocks_needed
         
         return  torch.tensor(partial_indices, device = self.device, dtype=torch.int32), torch.tensor(full_blocks, device= self.device, dtype=torch.int32),torch.tensor(final_blocks, device= self.device, dtype=torch.int32),
@@ -218,21 +218,21 @@ def paged_sdpa(
     nh_k = paged_cache.keys.size(2)
 
 
-    k_all = torch.zeros((B, max_key_length, nh_k,  hd), dtype=q.dtype, device = paged_cache.device)
-    v_all = torch.zeros((B, max_key_length, nh_k,  hd), dtype=q.dtype, device = paged_cache.device)
+    k_all = torch.randn((B, max_key_length, nh_k,  hd), dtype=q.dtype, device = paged_cache.device)
+    v_all = torch.randn((B, max_key_length, nh_k,  hd), dtype=q.dtype, device = paged_cache.device)
 
-    for batch_id, block_table in enumerate(paged_cache.block_tables):
+    # for batch_id, block_table in enumerate(paged_cache.block_tables):
         
         
-        offset = 0
-        for block_id, physical_block_num in enumerate(block_table.physical_block_values[:block_table.num_valid_blocks]):
+    #     offset = 0
+    #     for block_id, physical_block_num in enumerate(block_table.physical_block_values[:block_table.num_valid_blocks]):
             
             
-            filled = paged_cache.filled[physical_block_num]
-            k_all[batch_id, offset:offset+filled] = paged_cache.keys[physical_block_num][:filled]
-            v_all[batch_id, offset:offset+filled] = paged_cache.values[physical_block_num][:filled]
+    #         filled = paged_cache.filled[physical_block_num]
+    #         k_all[batch_id, offset:offset+filled] = paged_cache.keys[physical_block_num][:filled]
+    #         v_all[batch_id, offset:offset+filled] = paged_cache.values[physical_block_num][:filled]
 
-            offset += filled
+    #         offset += filled
         
     k_all = k_all.transpose(1,2).contiguous()
     v_all = v_all.transpose(1,2).contiguous()
