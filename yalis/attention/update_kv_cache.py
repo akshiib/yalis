@@ -11,7 +11,8 @@ def update_paged_kv_cache_kernel(
     B, S, H, D,
     max_pages_per_seq,
     page_block_size,
-    layout_mode: tl.constexpr,  
+    pt_block_stride, pt_token_stride, pt_head_stride, pt_feature_stride,
+    key_batch_stride, key_token_stride, key_head_stride, key_feature_stride,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -23,12 +24,12 @@ def update_paged_kv_cache_kernel(
     b = pid // S
     s = pid % S
 
-    # Offset in kv cache
+    # calculate physical block id 
     cache_offset = tl.load(cache_seq_len_ptr + b)
     token_offset = cache_offset + s
-    page_id = token_offset // page_block_size
+    logical_block_id = token_offset // page_block_size
     offset_in_block = token_offset % page_block_size
-    block_id = tl.load(block_table_ptr + b * max_pages_per_seq + page_id)
+    physical_block_id = tl.load(block_table_ptr + b * max_pages_per_seq + logical_block_id)
 
     # Shared across layouts
     offs_d = tl.arange(0, BLOCK_D)
@@ -41,50 +42,36 @@ def update_paged_kv_cache_kernel(
         offs_h_broadcast = offs_h[:, None]
         offs_d_broadcast = offs_d[None, :]
 
-        token_idx = b * S + s
-        k_src_ptrs = k_ptr + token_idx * H * D + offs_h_broadcast * D + offs_d_broadcast
-        v_src_ptrs = v_ptr + token_idx * H * D + offs_h_broadcast * D + offs_d_broadcast
+        src_ptr_offsets = key_batch_stride * b + key_token_stride * s + offs_h_broadcast * key_head_stride + offs_d_broadcast * key_feature_stride
+        k_src_ptrs = k_ptr + src_ptr_offsets 
+        v_src_ptrs = v_ptr + src_ptr_offsets
 
-        if layout_mode == 0: # this is what flash attention uses
-            # Unified layout: [num_blocks, page_block_size, H, D]
-            dst_base = ((block_id * page_block_size + offset_in_block) * H) * D
-            dst_ptrs = dst_base + offs_h_broadcast * D + offs_d_broadcast
+        # Unified layout: [num_blocks, page_block_size, H, D]
+        dst_base = physical_block_id * pt_block_stride + offset_in_block * pt_token_stride 
+        dst_ptrs = dst_base + offs_h_broadcast * pt_head_stride + offs_d_broadcast * pt_feature_stride
 
-            k_dst_ptrs = cache_k_ptr + dst_ptrs
-            v_dst_ptrs = cache_v_ptr + dst_ptrs
+        k_dst_ptrs = cache_k_ptr + dst_ptrs
+        v_dst_ptrs = cache_v_ptr + dst_ptrs
 
-            k_vals = tl.load(k_src_ptrs, mask=mask_h[:, None] & mask_d[None, :])
-            v_vals = tl.load(v_src_ptrs, mask=mask_h[:, None] & mask_d[None, :])
-            tl.store(k_dst_ptrs, k_vals, mask=mask_h[:, None] & mask_d[None, :])
-            tl.store(v_dst_ptrs, v_vals, mask=mask_h[:, None] & mask_d[None, :])
-
-        else: # this is what sdpa and flex attention use
-            # Per-head layout: [H, num_blocks, page_block_size, D]
-            for i in range(BLOCK_H):
-                if offs_h[i] >= H:
-                    continue
-                h = offs_h[i]
-                k_val = tl.load(k_src_ptrs[i, :], mask=mask_d)
-                v_val = tl.load(v_src_ptrs[i, :], mask=mask_d)
-
-                dst_offset = ((block_id * page_block_size + offset_in_block) * D) + offs_d
-                k_dst_ptr = cache_k_ptr + h * page_block_size * max_pages_per_seq * D + dst_offset
-                v_dst_ptr = cache_v_ptr + h * page_block_size * max_pages_per_seq * D + dst_offset
-
-                tl.store(k_dst_ptr, k_val, mask=mask_d)
-                tl.store(v_dst_ptr, v_val, mask=mask_d)
+        k_vals = tl.load(k_src_ptrs, mask=mask_h[:, None] & mask_d[None, :])
+        v_vals = tl.load(v_src_ptrs, mask=mask_h[:, None] & mask_d[None, :])
+        tl.store(k_dst_ptrs, k_vals, mask=mask_h[:, None] & mask_d[None, :])
+        tl.store(v_dst_ptrs, v_vals, mask=mask_h[:, None] & mask_d[None, :])
 
 
-def update_paged_kv_cache(k:torch.Tensor, 
+
+
+def update_paged_kv_cache( k:torch.Tensor, 
                            v:torch.Tensor,
                            block_table:torch.Tensor, 
                            cache_seq_len:torch.Tensor,
                            k_cache:torch.Tensor, 
                            v_cache:torch.Tensor):
+    # note that k and v are of shape [B, S, H, D]
+    # and k_cache and v_cache are of shape [num_blocks, page_block_size, H, D]
     
     B, S, H, D = k.shape
-    BLOCK_D = D        
-    BLOCK_H = min(1024 // BLOCK_D, H)        
+    BLOCK_H = min(1024 // D, H)        
 
     grid = (B * S,)    # one program per token
 
@@ -98,7 +85,8 @@ def update_paged_kv_cache(k:torch.Tensor,
         B, S, H, D,
         max_pages_per_seq,
         page_block_size,
-        layout_mode=0,
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         BLOCK_H=BLOCK_H,
-        BLOCK_D=BLOCK_D,
+        BLOCK_D=D
     )
