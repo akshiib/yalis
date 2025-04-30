@@ -39,7 +39,7 @@ if __name__ == "__main__":
     ]
 
     # take 16 prompts from this dataset
-    user_prompts = user_prompts[:16]
+    user_prompts = user_prompts[:2]
     print(f"Number of prompts = {len(user_prompts)}")
 
 
@@ -72,8 +72,8 @@ if __name__ == "__main__":
                                        top_p=0.80,
                                        temperature=1.0, 
                                        tp_dims=None,
-                                       attention_backend="flash",
-                                       use_paged_kv_caching=False)
+                                       attention_backend="flex",
+                                       use_paged_kv_caching=True)
 
 
     engine = LLMEngine(model_config=model_config, inference_config=inference_config)
@@ -87,7 +87,7 @@ if __name__ == "__main__":
         profiler_context = nullcontext()
 
     with profiler_context as prof:
-        for iter in range(10):
+        for iter in range(2):
             output_tokens, metrics = engine.generate(
                 input_prompts, report_throughput=True, tokens_to_generate=tokens_to_gen
             )

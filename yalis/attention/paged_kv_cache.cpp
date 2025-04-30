@@ -35,6 +35,9 @@ public:
         // Initialize tokens_assigned_ which tracks how many tokens are currently
         // in the KV cache for each sequence. Initially, every sequence has 0 tokens.
         tokens_assigned_ = torch::zeros({batch_size_}, torch::kInt64);
+
+        page_to_sequence_ = torch::full({num_blocks_}, -1, 
+            torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
         
         // Initialize the FIFO queue of free pages with indices from 0 to num_blocks - 1.
         for (int32_t i = 0; i < static_cast<int32_t>(num_blocks_); i++) {
@@ -88,10 +91,12 @@ public:
                     }
                     // Update the block_table_ for sequence 'seq' at column 'block_idx'.
                     block_table_.index_put_({seq, block_idx}, free_page);
+                    page_to_sequence_.index_put_({free_page}, seq);
                 }
             }
             // Update tokens_assigned_ for this sequence to new_total_tokens.
             tokens_assigned_.index_put_({seq}, new_total_tokens);
+            
         }
         return block_table_;
     }
@@ -129,6 +134,7 @@ public:
         for (int64_t i = 0; i < page_count; i++) {
             if (row_accessor[i] != -1) {
                 free_pages_.push_back(row_accessor[i]);
+                page_to_sequence_.index_put_({row_accessor[i]}, -1);
             }
         }
         // Reset the row for the sequence by filling it with -1.
@@ -150,6 +156,15 @@ public:
     // Accessor for the block table (for debugging or introspection).
     torch::Tensor block_table() const { return block_table_; }
 
+    int64_t page_block_size(){ return page_block_size_;}
+
+    int64_t owner_of_kv_idx(int64_t kv_idx){ 
+        int64_t physical_page_id = kv_idx / page_block_size_;
+        return page_to_sequence_[physical_page_id].item<int64_t>();
+    }
+
+    torch::Tensor page_to_sequence() const { return page_to_sequence_; }
+
 private:
     int64_t batch_size_;
     int64_t max_num_blocks_per_seq_;
@@ -161,7 +176,8 @@ private:
     torch::Tensor block_table_;
     // Tensor holding the number of tokens currently in the KV cache for each sequence (shape [batch_size], int64).
     torch::Tensor tokens_assigned_;
-
+    // Tensor holding which page in the KV Cache is mapped to which sequence
+    torch::Tensor page_to_sequence_;
     // FIFO queue of free page indices (as int32).
     std::deque<int32_t> free_pages_;
 };
@@ -175,5 +191,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_pages_for_sequence", &KVCacheManager::get_pages_for_sequence)
         .def("release_sequence_pages", &KVCacheManager::release_sequence_pages)
         .def("reset", &KVCacheManager::reset)
-        .def("block_table", &KVCacheManager::block_table);
+        .def("block_table", &KVCacheManager::block_table)
+        .def("page_block_size", &KVCacheManager::page_block_size)
+        .def("page_to_sequence", &KVCacheManager::page_to_sequence)
+        .def("owner_of_kv_idx", &KVCacheManager::owner_of_kv_idx);
 }
