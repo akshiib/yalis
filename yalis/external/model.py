@@ -110,7 +110,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
-        self, input_ids: torch.Tensor, actual_sequence_lengths: torch.Tensor = None
+        self, input_ids: torch.Tensor, actual_sequence_lengths: torch.Tensor = None, mask = None
     ) -> torch.Tensor:
         idx = input_ids
         T = idx.size(1)
@@ -143,10 +143,15 @@ class GPT(nn.Module):
 
         block_table=self.kv_cache_manager.block_table() if self.config.use_paged_kv_caching else None
 
-        flex_attention_block_mask = (
-            create_causal_block_mask_for_flex_attention(self.token_counter, self.kv_length)
-            if self.config.attention_backend == AttentionBackend.FLEX else None
-        )
+        is_prefill = T > 1
+        # flex_attention_block_mask = (
+        #     create_causal_block_mask_for_flex_attention(Q_LEN=T, 
+        #                                                 KV_LEN=T if is_prefill else self.kv_length,
+        #                                                 token_counter=self.token_counter if not self.config.use_paged_kv_caching else None,
+        #                                                 paged_kv_cache_manager=self.kv_cache_manager if self.config.use_paged_kv_caching else None)
+        #     if self.config.attention_backend == AttentionBackend.FLEX else None
+        # )
+        flex_attention_block_mask = mask
 
         for block in self.transformer.h:
             x = block(x, self.cos, self.sin, self.token_counter, block_table, flex_attention_block_mask)

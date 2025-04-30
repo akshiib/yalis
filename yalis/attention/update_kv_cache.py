@@ -90,3 +90,21 @@ def update_paged_kv_cache( k:torch.Tensor,
         BLOCK_H=BLOCK_H,
         BLOCK_D=D
     )
+
+def update_static_kv_cache(k,
+                           v,
+                           k_cache,
+                           v_cache,
+                           cache_seqlens):
+    # head-first layout
+    B = k.size(0)
+    T = k.size(2)
+    if T == 1:
+        b_indices = torch.arange(B, device=k_cache.device)
+        t_indices = cache_seqlens.view(-1)
+        
+        k_cache[b_indices, :, t_indices, :] = k[:, :, 0, :]
+        v_cache[b_indices, :, t_indices, :] = v[:, :, 0, :]
+    else:
+        k_cache[:, :, :T, :] = k[:, :, :T, :]
+        v_cache[:, :, :T, :] = v[:, :, :T, :]

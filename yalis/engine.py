@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import time
 import gc
 from .timers import Timers
+from yalis.attention.masking import create_causal_block_mask_for_flex_attention
 
 # These flags are taken from the following URL -
 # https://github.com/pytorch/pytorch/blob/347f96061f1cff603983b9be19ec92b374329a5b/benchmarks/gpt_fast/generate.py#L19
@@ -258,6 +259,8 @@ class LLMEngine:
         self.model.token_counter.zero_()
         if self.inference_config.use_paged_kv_caching:
             self.model.kv_cache_manager.reset()
+
+        
         with torch.no_grad(), torch.autocast(
             self.device, dtype=self.dtype, cache_enabled=False
         ):
@@ -265,9 +268,19 @@ class LLMEngine:
                 self.device
             )  # Move prompt tokens to the device
             prompt_sequence_lengths = prompt_sequence_lengths.to(self.device)
+            
+            
             for step in range(tokens_to_generate):
                 timer_key = None
                 if step == 0:  # Prefill step
+                    T = current_input_to_model.size(1)
+                    mask = (
+                        create_causal_block_mask_for_flex_attention(Q_LEN=T, 
+                                                                KV_LEN=T, 
+                                                                token_counter=self.model.token_counter if not self.config.use_paged_kv_caching else None,
+                                                                paged_kv_cache_manager=self.model.kv_cache_manager if self.config.use_paged_kv_caching else None)
+                        #if self.config.attention_backend == AttentionBackend.FLEX else None
+                    )
                     timer_key = "prefill"
                     timers.start(timer_key)
                     # print_rank0(f"mem before prefill = {torch.cuda.memory_allocated() / 1e9:.2f} GB")

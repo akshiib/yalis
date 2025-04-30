@@ -165,7 +165,7 @@ class InferenceConfig:
         if self.tp_dims is not None and (type(self.tp_dims) != tuple or len(self.tp_dims) != 3):
             raise ValueError("tp_dims must be a 3-dimensional tuple.")
 
-        if self.use_paged_kv_caching and not self.attention_backend == AttentionBackend.FLASH:
+        if self.use_paged_kv_caching and not self.attention_backend in [AttentionBackend.FLASH, AttentionBackend.FLEX]:
             raise ValueError("use_paged_kv_caching requires attention_backend=flash")
 
         if self.use_intra_head_parallelism and not self.attention_backend == AttentionBackend.SDPA:

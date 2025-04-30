@@ -6,6 +6,7 @@ from axonn.intra_layer.communication import Drop, Gather
 import torch.distributed as dist
 from typing import Optional
 from torch.nn.attention.flex_attention import flex_attention
+from .update_kv_cache import update_static_kv_cache, update_paged_kv_cache
 
 def build_mask_from_index(index, t_max):
         B = index.size(0)
@@ -59,56 +60,16 @@ def intra_head_sdpa(q, k, v, attn_mask, process_group, enable_gqa, parallel=True
     return O
 
 
-
-def rotary_kv_update_sdpa_gen(
+def decode_attention(
     q: torch.Tensor,  # B,nh,1,hs
-    k: torch.Tensor,  # B,nh,1,hs
-    v: torch.Tensor,  # B,nh,1,hs
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    token_counter: torch.Tensor,  # B,1
     k_cache: torch.Tensor,  # B,nh,t_max,hs
     v_cache: torch.Tensor,  # B,nh,t_max,hs,
+    token_counter: torch.Tensor,  # B,1
     use_intra_head_parallelism: bool = False,
     use_flex: bool = False,
     flex_attention_block_mask = None,
 ) -> torch.Tensor:
-    if cos is not None and sin is not None:
-        cos = index_into_rope_cache_gen(cos, token_counter)
-        sin = index_into_rope_cache_gen(sin, token_counter)
-
-        if cos.dim() > 1:
-            # batch dimensions must align
-            # sin/cos are (B, T, hs) so we unsqeeze -3 for nh
-            # we count from back because all of apply_rope does
-            cos = cos.unsqueeze(-3)
-            sin = sin.unsqueeze(-3)
-        roped_tensors = []
-        for x in [q, k]:
-            head_size = x.size(-1)
-            x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
-            x2 = x[..., head_size // 2 :]  # (B, nh, T, hs/2)
-            rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
-            roped = (x * cos) + (rotated * sin)
-            roped = roped.to(dtype=x.dtype)
-            roped_tensors.append(roped)
-
-        q, k = roped_tensors
-
-    B = k_cache.size(0)
-    b_indices = torch.arange(B, device=k_cache.device)
-    t_indices = token_counter.view(-1)
-
-    if ax.config.G_intra_c > 1 and use_intra_head_parallelism:
-        k_cache[b_indices, :, t_indices, :] = Drop.apply(k[:, :, 0, :], ax.comm_handle.inner_intra_layer_parallel_group)
-        v_cache[b_indices, :, t_indices, :] = Drop.apply(v[:, :, 0, :], ax.comm_handle.inner_intra_layer_parallel_group)
-    else:
-        k_cache[b_indices, :, t_indices, :] = k[:, :, 0, :]
-        v_cache[b_indices, :, t_indices, :] = v[:, :, 0, :]
-    mask = build_mask_from_index(token_counter, t_max=k_cache.size(-2))
-    
-    
-    enable_gqa = q.size(1) != k.size(1)
+    enable_gqa = q.size(1) != k_cache.size(1)
     if use_intra_head_parallelism:
         assert not use_flex, "Intra head parallelism is not supported with flex attention"
         mask_float = torch.zeros_like(mask, dtype=torch.float32)
@@ -126,50 +87,24 @@ def rotary_kv_update_sdpa_gen(
             assert flex_attention_block_mask is not None, "flex attention requires a block mask" 
             out = flex_attention(q, k_cache, v_cache, enable_gqa=enable_gqa, block_mask=flex_attention_block_mask)
         else:
+            mask = build_mask_from_index(token_counter, t_max=k_cache.size(-2))
             out = torch.nn.functional.scaled_dot_product_attention(
                 q, k_cache, v_cache, attn_mask=mask[:, None, None, :], enable_gqa=enable_gqa
             )
         return out
 
-def rotary_kv_update_sdpa_prefill(
+def prefill_attention(
     q: torch.Tensor,  # B,nh,T,hs
     k: torch.Tensor,  # B,nh,T,hs
     v: torch.Tensor,  # B,nh,T,hs
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    k_cache: torch.Tensor,  # B,nh,t_max,hs
-    v_cache: torch.Tensor,  # B,nh,t_max,hs,
     use_intra_head_parallelism: bool = False,
-) -> torch.Tensor:
-    B, T = q.shape[0], q.shape[-2]
-    if cos is not None and sin is not None:
-        cos, sin = cos[:T], sin[:T]
-        # cos and sin are of shape (T, hs)
-        # we want to add singleton dimensions - (1, 1, T, hs)
-        cos = cos[None, None, :, :]
-        sin = sin[None, None, :, :]
-
-        roped_tensors = []
-        for x in [q, k]:
-            head_size = x.size(-1)
-            x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
-            x2 = x[..., head_size // 2 :]  # (B, nh, T, hs/2)
-            rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
-            roped = (x * cos) + (rotated * sin)
-            roped = roped.to(dtype=x.dtype)
-            roped_tensors.append(roped)
-
-        q, k = roped_tensors
-    
-    if ax.config.G_intra_c > 1 and use_intra_head_parallelism:
-        k_cache[:, :, :T, :] = Drop.apply(k[:, :, :T, :], ax.comm_handle.inner_intra_layer_parallel_group)
-        v_cache[:, :, :T, :] = Drop.apply(v[:, :, :T, :], ax.comm_handle.inner_intra_layer_parallel_group)
-    else:
-        k_cache[:, :, :T, :] = k[:, :, :T, :]
-        v_cache[:, :, :T, :] = v[:, :, :T, :]
-
+    use_flex: bool = False,
+    flex_attention_block_mask = None,
+) -> torch.Tensor:        
     enable_gqa = q.size(1) != k.size(1)
-    if False: # do not use intra head in 
+    use_intra_head_parallelism = False # for now we have disabled intra head parallelism for prefill
+    if use_intra_head_parallelism: 
+        # dead code
         out = intra_head_sdpa(
             q, k, v, None,
             ax.comm_handle.inner_intra_layer_parallel_group,
@@ -177,8 +112,46 @@ def rotary_kv_update_sdpa_prefill(
         )
         return out
     else:
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        use_flex = False 
+        if use_flex:
+            assert flex_attention_block_mask is not None, "flex attention requires a block mask" 
+            out = flex_attention(q, k, v, enable_gqa=enable_gqa, block_mask=flex_attention_block_mask)
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
         return out
+
+def apply_rope(q, k, cos, sin, cache_seqlens):
+    T = q.shape[-2]
+    if T == 1:
+        cos = index_into_rope_cache_gen(cos, cache_seqlens)
+        sin = index_into_rope_cache_gen(sin, cache_seqlens)
+        if cos.dim() > 1:
+            # batch dimensions must align
+            # sin/cos are (B, T, hs) so we unsqeeze -3 for nh
+            # we count from back because all of apply_rope does
+            cos = cos.unsqueeze(-3)
+            sin = sin.unsqueeze(-3)
+    else:
+        cos, sin = cos[:T], sin[:T]
+        # cos and sin are of shape (T, hs)
+        # we want to add singleton dimensions - (1, 1, T, hs)
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+
+    roped_tensors = []
+    for x in [q, k]:
+        head_size = x.size(-1)
+        x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
+        x2 = x[..., head_size // 2 :]  # (B, nh, T, hs/2)
+        rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
+        roped = (x * cos) + (rotated * sin)
+        roped = roped.to(dtype=x.dtype)
+        roped_tensors.append(roped)
+
+    q_roped, k_roped = roped_tensors
+
+    return q_roped, k_roped
+
 
 
 def sdpa_and_flex_attention(q: torch.Tensor, 
@@ -186,46 +159,55 @@ def sdpa_and_flex_attention(q: torch.Tensor,
               v: torch.Tensor,  
               k_cache: Optional[torch.Tensor] = None, 
               v_cache: Optional[torch.Tensor] = None,
-              cache_seqlens: Optional[torch.Tensor] = None,  
+              cache_seqlens: Optional[torch.Tensor] = None,
+              block_table: Optional[torch.Tensor] = None,  
               rotary_cos: Optional[torch.Tensor] = None,
               rotary_sin: Optional[torch.Tensor] = None,
               use_intra_head_parallelism: bool = False,
               use_flex: bool = False,
               flex_attention_block_mask = None,
-              **kwargs) -> torch.Tensor:
-    if "block_table" in kwargs and kwargs["block_table"] is not None:
-        raise ValueError("'block_table' or paged kv-caching is not compatible with SDPA attention.")
-    T = q.shape[-2]
-
-
+              ) -> torch.Tensor:
     if use_flex: 
         assert flex_attention_block_mask is not None, "flex attention requires a block mask" 
 
-    if T==1:
-        y = rotary_kv_update_sdpa_gen(
-                 q,
-                 k,
-                 v,
-                 rotary_cos,
-                 rotary_sin,
-                 cache_seqlens,  # B,1
-                 k_cache,  # B,nh,t_max,hs
-                 v_cache,  # B,nh,t_max,hs
-                 use_intra_head_parallelism,
-                 use_flex,
-                 flex_attention_block_mask
-             )
+    # apply rotary embeddings 
+    if rotary_cos is not None and rotary_sin is not None:
+        q, k = apply_rope(q, k, rotary_cos, rotary_sin, cache_seqlens)
+
+    # update kv-cache
+    k_to_update = Drop.apply(k, ax.comm_handle.inner_intra_layer_parallel_group) if use_intra_head_parallelism else k
+    v_to_update = Drop.apply(v, ax.comm_handle.inner_intra_layer_parallel_group) if use_intra_head_parallelism else v
+
+    if block_table is None:
+        update_static_kv_cache(k_to_update, v_to_update, k_cache, v_cache, cache_seqlens)
     else:
-        y = rotary_kv_update_sdpa_prefill(
+        # note that these transposes/permutes do not change the data layout. they just change the strides of the tensor.
+        # the transposes will "actually" happen if you call .contiguous() on the tensors, which we do not do here.
+        update_paged_kv_cache(k=k_to_update.transpose(1,2), # [B, H, S_k, D] -> [B, S_k, H, D] 
+                              v=v_to_update.transpose(1,2), # [B, H, S_k, D] -> [B, S_k, H, D]
+                              block_table=block_table,
+                              cache_seq_len=cache_seqlens,
+                              k_cache=k_cache.permute([1, 2, 0, 3]), # [H, NUM_PAGES, PAGE_BLOCK_SIZE, D] -> [NUM_PAGES, PAGE_BLOCK_SIZE, H, D]
+                              v_cache=v_cache.permute([1, 2, 0, 3])) # [H, NUM_PAGES, PAGE_BLOCK_SIZE, D] -> [NUM_PAGES, PAGE_BLOCK_SIZE, H, D]
+
+    T = q.shape[-2]
+    if T==1:
+        y = decode_attention(
                      q,
-                     k,
-                     v,
-                     rotary_cos,
-                     rotary_sin,
-                     k_cache,  # B,nh,t_max,hs
-                     v_cache,  # B,nh,t_max,hs
-                     use_intra_head_parallelism
+                     k_cache, 
+                     v_cache,  
+                     cache_seqlens,
+                     use_intra_head_parallelism,
+                     use_flex, 
+                     flex_attention_block_mask,
                  )
+    else:
+        y = prefill_attention(q=q, 
+                              k=k, 
+                              v=v, 
+                              use_intra_head_parallelism=use_intra_head_parallelism, 
+                              use_flex=use_flex, 
+                              flex_attention_block_mask=flex_attention_block_mask)       
     return y
 
 @register_attention("sdpa")
@@ -238,7 +220,7 @@ def sdpa_attention(q: torch.Tensor,
               rotary_cos: Optional[torch.Tensor] = None,
               rotary_sin: Optional[torch.Tensor] = None,
               use_intra_head_parallelism: bool = False,
-              **kwargs):
+              ):
     return sdpa_and_flex_attention(q=q,
                                    k=k,
                                    v=v,
@@ -249,7 +231,7 @@ def sdpa_attention(q: torch.Tensor,
                                    rotary_sin=rotary_sin,
                                    use_intra_head_parallelism=use_intra_head_parallelism,
                                    use_flex=False,
-                                   **kwargs)
+                                   )
 
 @register_attention("flex")
 def flex_attention_(q: torch.Tensor, 
@@ -262,8 +244,8 @@ def flex_attention_(q: torch.Tensor,
               rotary_sin: Optional[torch.Tensor] = None,
               use_intra_head_parallelism: bool = False,
               **kwargs):  
-    assert "flex_attention_block_mask" in kwargs, "flex attention requires a block mask"
-    flex_attention_block_mask = kwargs["flex_attention_block_mask"]
+    #assert "flex_attention_block_mask" in kwargs, "flex attention requires a block mask"
+    #flex_attention_block_mask = kwargs.pop("flex_attention_block_mask")
     return sdpa_and_flex_attention(q=q,
                             k=k,
                             v=v,
@@ -274,5 +256,5 @@ def flex_attention_(q: torch.Tensor,
                             rotary_sin=rotary_sin,
                             use_intra_head_parallelism=use_intra_head_parallelism,
                             use_flex=True,
-                            flex_attention_block_mask=flex_attention_block_mask,
-                            **kwargs)
+                            **kwargs,
+                            )
